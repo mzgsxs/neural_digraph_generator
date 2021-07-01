@@ -1,0 +1,48 @@
+---
+exp_name: digraph
+exp_dir: exp/
+use_gpu: true
+gpu_data_parallel: true
+device: cuda:0
+gpus: [0]
+seed: 1234
+dataset:
+  name: digraph # 1024 graphs size sampled from between 64 to 128
+  loader_name: digraph_loader
+  data_path: ../data/ #
+  shuffle: true
+  val_ratio: 0.2 # out of all training samples
+  train_ratio: 0.8 # out of all samples
+  save_split: true 
+  node_orderings: [degree_descent, k-core] # 
+  stride: 1 # interval for subgraph
+  block_size: 1 # number of new nodes to add 
+  use_subgraphs: false # if true, also get sub grapphs for training
+  sample_subgraph: false # if true use only some subgraphs, if false, use all subgraphs possible
+  num_subgraphs_to_sample: 2 # number of subgraphs per mini-batch
+  over_write_pre_processed: true
+train:
+  num_workers: 0
+  max_epoch: 20000
+  shuffle: true
+  batch_size_per_gpu: 8 # batch size per gpu  # TODO why this does not affect vram usage?
+  optimizer: SGD #Adam # SGD 
+  lr_decay: 0.1
+  lr_decay_epoch: [100000000] # no decay
+  lr: 1.0e-4
+  wd: 0.0e-4
+  momentum: 0.9
+  display_interval: 10 # in iterations
+  snapshot_interval: 100 # in epoches
+  valid_epoch: 50
+  resume: false
+  resume_epoch: false
+  resume_model_path: false
+model:
+  name: graph_auto_encoder 
+  training: true
+
+
+
+
+
