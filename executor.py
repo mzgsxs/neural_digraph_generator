@@ -3,8 +3,11 @@ import os
 import time
 import pickle
 from collections import defaultdict
+
 # third party libraries
 import numpy as np
+import networkx as nx
+
 import torch
 import torch.nn as nn
 import torch.utils.data
@@ -13,7 +16,7 @@ from tensorboardX import SummaryWriter
 # libraries
 import models
 import utils.data
-from utils import data_to_gpu, snapshot, load_model, EarlyStopper, compute_edge_ratio 
+from utils import data_to_gpu, snapshot, load_model, EarlyStopper, compute_edge_ratio, draw_and_save_graph
 from utils.logger import get_logger
 
 
@@ -43,7 +46,7 @@ class executor(object):
 
   def split_data(self):
     # load raw graphs into networkx format
-    self.graphs = utils.data.raw_graphs_to_nx(self.config.dataset.name, 
+    self.graphs = utils.data.raw_graphs_to_nx(self.config.dataset, 
                                               data_dir=self.config.dataset.data_path)
     # shuffle all graphs
     if self.config.dataset.shuffle:
@@ -90,8 +93,9 @@ class executor(object):
     optimizer = eval('optim.'+self.config.train.optimizer)(
                             params,
                             lr=self.config.train.lr,
-                            momentum=self.config.train.momentum,
-                            weight_decay=self.config.train.wd)
+                            weight_decay=self.config.train.wd,
+                            #momentum=self.config.train.momentum,
+                            )
     early_stop = EarlyStopper([0.0], win_size=100, is_decrease=False)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
                           optimizer,
@@ -102,8 +106,9 @@ class executor(object):
     # resume training
     resume_epoch = 0
     if self.config.train.resume:
-      load_model(model.module if self.config.use_gpu else model,
-                 self.config.train.resume_model_path,
+      model_path = os.path.join(self.config.train.resume_dir, self.config.train.resume_model_file_name)
+      load_model(model,
+                 model_path,
                  self.config.device,
                  optimizer=optimizer,
                  scheduler=lr_scheduler)
@@ -111,42 +116,65 @@ class executor(object):
     # load data into torch loader
     train_dataset = eval('utils.data.'+self.config.dataset.loader_name)(self.config, self.graphs_train, tag='train')
     batch_size = self.config.train.batch_size_per_gpu*self.num_gpu
-    train_loader = torch.utils.data.DataLoader(
-                         train_dataset,
-                         batch_size=batch_size,
-                         shuffle=self.config.train.shuffle,
-                         num_workers=self.config.train.num_workers,
-                         collate_fn=train_dataset.collate_fn,
-                         pin_memory=False, 
-                         drop_last=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=self.config.train.shuffle,
+                                               num_workers=self.config.train.num_workers,
+                                               collate_fn=train_dataset.collate_fn,
+                                               pin_memory=False, 
+                                               drop_last=False)
     # Training Loop
     results = defaultdict(list)
     for epoch in range(resume_epoch, self.config.train.max_epoch):
       model.train()
       lr_scheduler.step()
       #train_iterator = train_loader.__iter__()
-      for iter_count, (batch_graphs_gpus, batch_graph_sizes) in enumerate(train_loader):
+      for iter_count, (batch_graphs_gpus, _) in enumerate(train_loader):
         optimizer.zero_grad()
-        # final batch size to the model is (num_batch*num_orderings*(1+num_subgraphs)) x ...
-        existance_score, features = model(batch_graphs_gpus, batch_graph_sizes)
-        train_loss = model.loss(batch_graphs_gpus, existance_score, features) 
+        # final batch size to the model is (num_batch*num_orderings*(1+num_subgraphs)) in list
+        train_loss = model.loss(batch_graphs_gpus, model(batch_graphs_gpus)) 
         train_loss.backward()
-        # update weights 
         optimizer.step()
-        # clear batch_data buffer and logging
+        # logging
         self.writer.add_scalar('train_loss', train_loss, iter_count)
         results['train_loss'] += [float(train_loss.data.cpu().numpy())]
         results['train_step'] += [iter_count]
         if iter_count % self.config.train.display_interval == 0: # starting from 0
           logger.info("Loss @ epoch {:04d} iteration {:08d} = {}".format(epoch + 1, iter_count, train_loss))
-
       # snapshot model
       if (epoch + 1) % self.config.train.snapshot_interval == 0:
         logger.info("Saving Snapshot @ epoch {:04d}".format(epoch + 1))
-        snapshot(model, optimizer, self.config, epoch + 1, scheduler=lr_scheduler)
+        #snapshot(model, optimizer, self.config, epoch + 1, scheduler=lr_scheduler)
+        snapshot(model, optimizer, self.config, 0, scheduler=lr_scheduler) # NOTE for convinence, always use epoch 0
+        # inspect the performance on the last batch
+        if self.config.train.inspect is True:
+          graphs = batch_graphs_gpus[0:8]
+          existance_score, features = model.sample(15) # draw 16 graphs in 4 by 4
+          graphs_hat = model.to_graph(existance_score, features)
+          # convert sparse graphs to networkx format and draw the graph and save it
+          utils.draw_a_list_of_graphs(graphs+graphs_hat, 4, 4, os.path.join(self.config.save_dir,'generation_samples'))
     # save final training stats
     pickle.dump(results, open(os.path.join(self.config.save_dir, 'train_stats.p'), 'wb'))
     self.writer.close()
     return True
+
+
+
+  def sample(self):
+    # create models
+    model = eval('models.'+self.config.model.name)(self.config.model)
+    model = model.to(0)
+    # load model
+    model_path = os.path.join(self.config.inspect.resume_dir, self.config.inspect.resume_model_file_name)
+    load_model(model,
+               model_path,
+               self.config.device)
+    # Sampling Loop
+    existance_score, features = model.sample(16) # draw 16 graphs in 4 by 4
+    graphs_hat = model.to_graph(existance_score, features)
+    # convert sparse graphs to networkx format and draw the graph and save it
+    utils.draw_a_list_of_graphs(graphs_hat, 4, 4, os.path.join(self.config.save_dir,'generation_samples'))
+    return True
+
 
 
