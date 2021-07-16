@@ -17,20 +17,27 @@ from tqdm import tqdm
 from collections import defaultdict
 
 
-def raw_graphs_to_nx(graph_type, data_dir='data', noise=10.0, seed=1234):
+def raw_graphs_to_nx(config, data_dir='data', noise=10.0, seed=1234):
   '''
   load original graph datasets from disk or generate on the fly
   then convert them into networkx formats
   '''
   npr = np.random.RandomState(seed)
   graphs = []
+  graph_type = config.name
   # generate digraphs
-  if graph_type == 'digraph':
-    graphs = []
-    for i in range(1024):
-      G = nx.gn_graph(np.random.randint(64,128))
+  if graph_type == 'growing_digraph':
+    for i in range(config.num_graphs):
+      G = nx.gn_graph(np.random.randint(16,32))
       G = nx.stochastic_graph(G)
       graphs.append(G)    
+  if graph_type == 'grid_2d_digraph':
+    for i in range(config.num_lines_min, config.num_lines_max+1):
+      for j in range(config.num_lines_min, config.num_lines_max+1):
+        G = nx.grid_2d_graph(i,j)
+        G = G.to_directed(G)
+        G = nx.stochastic_graph(G)
+        graphs.append(G)    
   # load local graph data TODO
   # Print info for the data set
   num_nodes = [gg.number_of_nodes() for gg in graphs]
@@ -38,6 +45,25 @@ def raw_graphs_to_nx(graph_type, data_dir='data', noise=10.0, seed=1234):
   print('max # nodes = {} || mean # nodes = {}'.format(max(num_nodes), np.mean(num_nodes)))
   print('max # edges = {} || mean # edges = {}'.format(max(num_edges), np.mean(num_edges))) 
   return graphs
+
+
+def permute_ordering(adj, order=None):
+  '''
+  if order is not specified, permute randomly
+  In:
+    adj: numpy matrix
+      shape: num_nodes x num_nodes 
+      adjacency matrix of a graph
+    order: numpy array
+      shape: num_nodes x 1
+  Out:
+    adj_p: same as input
+      permuted adjacency matrix
+  '''
+  len_batch = adj.shape[0]
+  x_idx = np.random.permutation(len_batch) if order is None else order
+  adj = adj[np.ix_(x_idx, x_idx)]
+  return  np.asmatrix(adj)
 
 
 class digraph_loader(object):
@@ -58,22 +84,27 @@ class digraph_loader(object):
     self.block_size = config.dataset.block_size
     if self.config.dataset.sample_subgraph:
       assert self.config.dataset.num_subgraphs_to_sample > 0
-    # pre-process the data and save it to disk
+    # pre-process the data and save it to ssd or ram-disk
     self.save_path = os.path.join(self.config.exp_dir, 
            'data_pre_processed','{}_{}_block_size_{}_stride_{}'.format(
             config.dataset.name, tag, self.block_size, self.stride, 
             self.config.dataset.node_orderings))
-    if not os.path.isdir(self.save_path) or self.config.dataset.over_write_pre_saved:
+    if not os.path.isdir(self.save_path) or self.config.dataset.over_write_pre_processed:
       self.file_names = []
       if not os.path.isdir(self.save_path):
         os.makedirs(self.save_path)
       self.config.dataset.save_path = self.save_path
+      if self.config.dataset.ram_disk:
+        self.ram_disk = []
       for index in tqdm(range(self.num_graphs)):
         G = self.graphs[index]
         data = self._get_graph_data(G)
-        tmp_path = os.path.join(self.save_path, '{}_{}.p'.format(tag, index))
-        pickle.dump(data, open(tmp_path, 'wb'))
-        self.file_names += [tmp_path]
+        if self.config.dataset.ram_disk:
+          self.ram_disk.append(data)
+        else:
+          tmp_path = os.path.join(self.save_path, '{}_{}.p'.format(tag, index))
+          pickle.dump(data, open(tmp_path, 'wb'))
+          self.file_names += [tmp_path]
     else:
       self.file_names = glob.glob(os.path.join(self.save_path, '*.p'))
 
@@ -121,6 +152,23 @@ class digraph_loader(object):
             reverse=True)
         node_list += [nn for nn, dd in sort_node_tuple]
       adj['k-core'] = np.array(nx.to_numpy_matrix(G, nodelist=node_list))
+    ### BFS & DFS 
+    if 'bfs' or 'dfs' in self.config.dataset.node_orderings:
+      UG = G.to_undirected()
+      CGs = [UG.subgraph(c) for c in nx.connected_components(UG)]
+      # rank connected componets from large to small size
+      CGs = sorted(CGs, key=lambda x: x.number_of_nodes(), reverse=True)
+      node_list_bfs = []
+      node_list_dfs = []
+      for ii in range(len(CGs)):
+        node_degree_list = [(n, d) for n, d in CGs[ii].degree()]
+        degree_sequence = sorted(node_degree_list, key=lambda tt: tt[1], reverse=True)
+        bfs_tree = nx.bfs_tree(CGs[ii], source=degree_sequence[0][0])
+        dfs_tree = nx.dfs_tree(CGs[ii], source=degree_sequence[0][0])
+        node_list_bfs += list(bfs_tree.nodes())
+        node_list_dfs += list(dfs_tree.nodes())
+      adj['bfs'] = np.array(nx.to_numpy_matrix(G, nodelist=node_list_bfs))
+      adj['dfs'] = np.array(nx.to_numpy_matrix(G, nodelist=node_list_dfs))
     ### fill in required orderings
     adjs = [adj[order_name] for order_name in self.config.dataset.node_orderings] 
     return adjs
@@ -141,9 +189,10 @@ class digraph_loader(object):
     '''
     K, S = self.block_size, self.stride
     # load one single graph
-    adj_list = pickle.load(open(self.file_names[index], 'rb'))
-    num_nodes = adj_list[0].shape[0]
+    adjs = self.ram_disk[index] if self.config.dataset.ram_disk else pickle.load(open(self.file_names[index], 'rb'))
+    num_nodes = adjs[0].shape[0]
     subgraphs, sizes = [], []
+
     if self.config.dataset.use_subgraphs:
       # use all sub-graphs possible
       subgraph_indices = np.arange(0,num_nodes-K,S)
@@ -152,9 +201,11 @@ class digraph_loader(object):
       if self.config.dataset.sample_subgraph:
         num_subgraphs = min(num_subgraphs, self.config.dataset.num_subgraphs_to_sample)
         subgraph_indices = self.npr.randint(0,high=(num_nodes-K),size=num_subgraphs).tolist()
+
     # for each ordering
-    for i in range(len(adj_list)):
-      adj_order_i = adj_list[i]
+    for i in range(len(adjs)):
+      adj_order_i = permute_ordering(adjs[i]) if self.config.dataset.permute_node_ordering else adjs[i]
+      #print(np.ceil(adj_order_i).astype('int'))
       # makesure its a 3 dimensional array, i.e. num_nodes x num_nodes x dim_edge_feature
       if adj_order_i.ndim == 2: adj_order_i = np.expand_dims(adj_order_i,-1)
       adj_order_i_tor = torch.from_numpy(adj_order_i.astype('float32'))
@@ -163,6 +214,7 @@ class digraph_loader(object):
       # make sure the full graph is always included
       subgraphs.append(adj_order_i_tor)
       sizes.append(num_nodes)
+
       if self.config.dataset.use_subgraphs:
         for j in subgraph_indices:
           # get the subgraph
@@ -171,6 +223,7 @@ class digraph_loader(object):
           adj_subgraph_tor = adj_subgraph_tor.to_sparse(2)
           subgraphs.append(adj_subgraph_tor)
           sizes.append(j)
+
     return (subgraphs, sizes)
 
 
@@ -179,12 +232,14 @@ class digraph_loader(object):
     takes a list of batch_size numbers of data, each data in the format of __getitem__(),
     combine batch_size dimension and num_subgraphs dimension and load all data into gpu
       batch_size = (batch_size_per_gpu * num_gpu)
+
+    * num_nodes is different for each graph
     In:
       batch_data: list of tuple (tensors, sizes)
-        shape: [batch_size x (num_all_subgraphs x N_max x N_max, num_all_subgraphs x 1)]
+        shape: [batch_size x (num_all_subgraphs x num_nodes x num_nodes, num_all_subgraphs x 1)]
     Output:
       batch_graphs_gpus: list of tensors loaded in gpus
-        shape: [(batch_size * num_all_subgraphs) x (N_max x N_max x dim_edge_feature)]
+        shape: [(batch_size * num_all_subgraphs) x (num_nodes x num_nodes x dim_edge_feature)]
       sizes: list of int
         shape: [(batch_size * num_all_subgraphs) x 1]
     '''

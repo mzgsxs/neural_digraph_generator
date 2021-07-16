@@ -4,6 +4,11 @@ import torch
 from utils.parser import edict2dict
 from easydict import EasyDict as edict
 
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import figure
+
 
 def compute_edge_ratio(G_list):
   num_edges_max, num_edges = .0, .0
@@ -55,6 +60,64 @@ def load_model(model, file_name, device, optimizer=None, scheduler=None):
 
   if scheduler is not None:
     scheduler.load_state_dict(model_snapshot["scheduler"])
+
+
+def sparse_tensor_to_digraph(g):
+  '''
+  convert sparse tensor g of shape num_nodes x num_nodes x 1 into networkx digraph object
+  '''
+  indices = torch.transpose(g.indices(),0,1) # 2 x num_nodes > num_nodes x 2
+  values = g.values() # num_nodes x 1
+  g_nx = nx.DiGraph()
+  g_nx.add_weighted_edges_from(torch.cat((indices, values), dim=1).tolist()) 
+  return g_nx
+
+
+def draw_and_save_graph(G, save_path):
+  '''
+  draw and save graph plot into experiment folder
+  In:
+    G: networkx digraph
+    save_path: string
+  '''
+  edges = [(u, v) for (u, v, d) in G.edges(data=True)]
+  pos = nx.spectral_layout(G)
+  # draw nodes, edges, labels
+  nx.draw_networkx_nodes(G, pos, node_size=30)
+  nx.draw_networkx_edges(G, pos, edgelist=edges)#, width=weights)
+  fig =  plt.gcf()
+  fig.set_size_inches(10, 10)
+  ax = plt.gca()
+  ax.margins(0.08)
+  plt.axis("off")
+  plt.tight_layout()
+  plt.savefig(save_path)
+  plt.clf() 
+
+
+def draw_a_list_of_graphs(G_list, row, col, fname, layout='spring'):
+    '''
+    draw a list of graphs
+    In:
+      G_list: list of nx formated graphs
+        the length should be row*col
+      fname: 
+    '''
+    plt.switch_backend('agg')
+    for i, G in enumerate(G_list):
+        G = sparse_tensor_to_digraph(G) 
+        plt.subplot(row,col,i+1)
+        plt.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=0, hspace=0)
+        plt.axis("off")
+        if layout=='spring':
+            pos = nx.spring_layout(G,iterations=100)
+        elif layout=='spectral':
+            pos = nx.spectral_layout(G)
+        nx.draw_networkx_nodes(G, pos, node_size=1.5, alpha=1, linewidths=0.2)
+        nx.draw_networkx_edges(G, pos, alpha=0.3, width=0.2, arrowsize=1)
+    plt.tight_layout()
+    plt.savefig(fname+'.png', dpi=1800)
+    plt.close()
 
 
 class EarlyStopper(object):

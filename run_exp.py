@@ -34,10 +34,10 @@ def main():
   # Run the experiment
   try:
     ex = executor(config)
-    if not args.test:
+    if config.training:
       ex.train()
     else:
-      ex.test()
+      ex.sample()
   except:
     logger.error(traceback.format_exc())
 

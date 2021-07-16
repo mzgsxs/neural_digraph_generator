@@ -6,42 +6,61 @@ gpu_data_parallel: true
 device: cuda:0
 gpus: [0]
 seed: 1234
+training: true
 dataset:
-  name: digraph # 1024 graphs size sampled from between 64 to 128
+  name: grid_2d_digraph # 128 graphs size sampled from between 5 to 10
+  num_lines_min: 10
+  num_lines_max: 20
   loader_name: digraph_loader
   data_path: ../data/ #
+  ram_disk: true
+  permute_node_ordering: false
   shuffle: true
-  val_ratio: 0.2 # out of all training samples
-  train_ratio: 0.8 # out of all samples
+  val_ratio: 0.0 # out of all training samples
+  train_ratio: 1.0 # out of all samples, test_ratio is 1-train_ratio
   save_split: true 
-  node_orderings: [degree_descent, k-core] # 
+  node_orderings: [dfs] # 
   stride: 1 # interval for subgraph
   block_size: 1 # number of new nodes to add 
   use_subgraphs: false # if true, also get sub grapphs for training
   sample_subgraph: false # if true use only some subgraphs, if false, use all subgraphs possible
-  num_subgraphs_to_sample: 2 # number of subgraphs per mini-batch
+  num_subgraphs_to_sample: 0 # number of subgraphs per mini-batch
   over_write_pre_processed: true
 train:
   num_workers: 0
   max_epoch: 20000
   shuffle: true
-  batch_size_per_gpu: 8 # batch size per gpu  # TODO why this does not affect vram usage?
-  optimizer: SGD #Adam # SGD 
-  lr_decay: 0.1
-  lr_decay_epoch: [100000000] # no decay
+  batch_size_per_gpu: 1 # number of graphs  # TODO why this does not affect vram usage?
+  optimizer: Adam # SGD 
+  lr_decay: 0.5
+  lr_decay_epoch: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000] # multiplies lr_decay at those epoches
   lr: 1.0e-4
   wd: 0.0e-4
-  momentum: 0.9
+  momentum: 0.9 # only for SGD
   display_interval: 10 # in iterations
-  snapshot_interval: 100 # in epoches
-  valid_epoch: 50
-  resume: false
-  resume_epoch: false
-  resume_model_path: false
+  snapshot_interval: 50 # in epoches
+  inspect: true # if ture draw, and save figures after snapshot model
+  resume: true
+  resume_epoch: 0
+  resume_dir: ./exp/graph_auto_encoder
+  resume_model_file_name: model_snapshot_0000000.pth
+inspect:
+  resume_dir: ./exp/graph_auto_encoder
+  resume_model_file_name: model_snapshot_0000000.pth
 model:
   name: graph_auto_encoder 
   training: true
+  dim_gene_code: 128
+  decoder:
+    name: gnn
+    sample_subgraphs: 100  # only sample some of those subgraphs
+    stride: 1 # self.num_new_nodes-1 # 1 # sample_stride
+    num_new_nodes: 1 # block_size, num of nodes to add at each iteration
+    max_num_nodes: 400
+    dim_node_feature: 128 # adjacency row vector is projected to a 64 dimensional feature vector
+    num_mix_component: 20
 
+    
 
 
 
