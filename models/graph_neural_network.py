@@ -335,7 +335,7 @@ class GraphGenGnn(nn.Module):
         nn.ReLU(inplace=True),
         nn.Linear(128, 128),
         nn.ReLU(inplace=True),
-        nn.Linear(128, self.cf.num_mix_component))
+        nn.Linear(128, 2*self.cf.num_mix_component))
     self.output_alpha = nn.Sequential(
         nn.Linear(self.cf.dim_node_feature, 128),
         nn.ReLU(inplace=True),
@@ -364,7 +364,8 @@ class GraphGenGnn(nn.Module):
       edges = []
       node_idx_gnn = []
       node_idx_feat = []
-      label = []
+      label_ij = []
+      label_ji = []
       subgraph_size = []
       subgraph_idx = []
       att_idx = []
@@ -382,14 +383,12 @@ class GraphGenGnn(nn.Module):
                            constant_values=1.0)  # assuming fully connected for the new block
         adj_block = torch.from_numpy(adj_block).to_sparse()
         edges += [adj_block.coalesce().indices().long()]
-
         ### attention index, existing nodes: 0, new nodes: 1, ..., K
         if start_idx == 0:
           att_idx += [np.arange(1, self.cf.num_new_nodes + 1).astype(np.uint8)]
         else:
           att_idx += [np.concatenate([np.zeros(start_idx).astype(np.uint8),
                                       np.arange(1, self.cf.num_new_nodes + 1).astype(np.uint8)])]
-
         ### get node feature index for GNN input
         # use inf to indicate the new nodes where input feature is zero
         if start_idx == 0:
@@ -397,7 +396,6 @@ class GraphGenGnn(nn.Module):
         else:
           node_idx_feat += [np.concatenate([np.arange(start_idx),
                             np.ones(self.cf.num_new_nodes) * -1])]
-
         ### get node index for GNN output
         idx_row_gnn, idx_col_gnn = np.meshgrid(np.arange(start_idx, start_idx + self.cf.num_new_nodes), 
                                                np.arange(start_idx + self.cf.num_new_nodes))
@@ -405,54 +403,54 @@ class GraphGenGnn(nn.Module):
         idx_col_gnn = idx_col_gnn.reshape(-1, 1)
         node_idx_gnn += [np.concatenate([idx_row_gnn, idx_col_gnn],
                                         axis=1).astype(np.int64)]
-
-        ### get predict label
-        l = adj_full[idx_row_gnn, idx_col_gnn] > 0
-        label += [l.flatten().astype(np.uint8)]
-
+        ### get predict label for i to j
+        l_ij = adj_full[idx_row_gnn, idx_col_gnn] > 0
+        label_ij += [l_ij.flatten().astype(np.uint8)]
+        ### get predict label for j to i
+        l_ji = adj_full[idx_col_gnn, idx_row_gnn] > 0
+        label_ji += [l_ji.flatten().astype(np.uint8)]
+        ### for loss
         subgraph_size += [start_idx + self.cf.num_new_nodes]
-        subgraph_idx += [np.ones_like(label[-1]).astype(np.int64) * subgraph_count]
+        subgraph_idx += [np.ones_like(label_ij[-1]).astype(np.int64) * subgraph_count]
         subgraph_count += 1
-
       ### adjust index base for subgraphs
       cum_size = np.cumsum([0] + subgraph_size).astype(np.int64)
       for i in range(len(edges)):
         edges[i] = edges[i] + cum_size[i]
         node_idx_gnn[i] = node_idx_gnn[i] + cum_size[i]
-
       self.edges = torch.cat(edges, dim=1).t().long()
       self.edges = self.edges.to(0)
       self.att_idx = torch.from_numpy(np.concatenate(att_idx)).long().to(0)
       self.node_idx_nodes = torch.from_numpy(np.concatenate(node_idx_feat)).long().to(0)
       self.new_nodes_idx = torch.from_numpy(np.concatenate(node_idx_gnn)).long().to(0)
-      self.label = torch.from_numpy(np.concatenate(label)).float().to(0)
+      self.label_ij = torch.from_numpy(np.concatenate(label_ij)).float().to(0)
+      self.label_ji = torch.from_numpy(np.concatenate(label_ji)).float().to(0)
       self.subgraph_idx = torch.from_numpy(np.concatenate(subgraph_idx)).long().to(0)
       self.subgraph_count = subgraph_count
       self.subgraph_idx_base = torch.tensor([0, subgraph_count], device=0).long()
-
+      
 
   def _forward_training(self, graphs): 
     '''
     '''
     self._break_graph(graphs[0])
-    ### GNN inference #  BCN_max x H
+    #--- GNN for new nodes embedding 
     # all new nodes will have zero as node feature, indexed by -1
     node_features = F.pad(self.adj_vecs_to_nodes_state(self.A_pad), (0, 0, 0, 1), 'constant', value=0.0) 
-    # (BCN_max + 1) x N_max
-    # create symmetry-breaking edge feature for the newly generated nodes
-    # create one-hot feature !!! NOTE scatter with empty index seems to cause problem on CPU but not on GPU
+    # create one-hot edge feature, each with size of (num_new_nodes+1)*2
+    # [1 0 ...] if source node is not new, [0 1 0 ...] if source node is new node 1. [0 0 1 ...] etc
     att_idx = self.att_idx.view(-1, 1)
     att_edge_feature = torch.zeros(self.edges.shape[0], 2*self.cf.dim_att_edge).to(0)
     att_edge_feature = att_edge_feature.scatter(1, att_idx[[self.edges[:, 0]]], 1)
     att_edge_feature = att_edge_feature.scatter(1, att_idx[[self.edges[:, 1]]] + self.cf.dim_att_edge, 1)
-    # get node states for new nodes !!! NOTE node_feature is shared among all subgraphs
+    # get node states for new nodes !!! node_feature is shared among all subgraphs
     node_state = self.gne(node_features[self.node_idx_nodes], self.edges, att_edge_feature)
-    ### Pairwise prediction for the existance of the new edges
+    #--- Pairwise prediction for the existance of the new edges
     diff = node_state[self.new_nodes_idx[:, 0], :] - node_state[self.new_nodes_idx[:, 1], :]
-    log_theta = self.output_theta(diff)  # B X (tt+K)K
-    log_alpha = self.output_alpha(diff)  # B X (tt+K)K
-    log_theta = log_theta.view(-1, self.cf.num_mix_component)  # B X CN(N-1)/2 X K
-    log_alpha = log_alpha.view(-1, self.cf.num_mix_component)  # B X CN(N-1)/2 X K
+    # num_new_edges x 2 x num_mix_component
+    log_theta = self.output_theta(diff).view(-1, 2, self.cf.num_mix_component)
+    # num_new_edges x num_mix_component
+    log_alpha = self.output_alpha(diff).view(-1, self.cf.num_mix_component)  
     return log_theta, log_alpha
 
 
@@ -461,10 +459,10 @@ class GraphGenGnn(nn.Module):
     """
       Compute likelihood for mixture of Bernoulli model
       In:
-        self.label: E X 1, see comments above
+        label: E X 1, see comments above
         log_theta: E X D, see comments above
         log_alpha: E X D, see comments above
-        adj_loss_func: BCE loss
+        adj_loss_func: BinaryCrossEntropy loss
         subgraph_idx: E X 1, see comments above
         subgraph_idx_base: B+1, cumulative # of edges in the subgraphs associated with each batch
         num_canonical_order: int, number of node orderings considered
@@ -476,57 +474,53 @@ class GraphGenGnn(nn.Module):
       Returns:
         loss (and potentially neg log prob)
     """
-
+    self.device = self.label_ij.device
+    num_graphs = self.subgraph_idx_base.shape[0] - 1
     num_subgraph = self.subgraph_idx_base[-1] # == subgraph_idx.max() + 1
-    B = self.subgraph_idx_base.shape[0] - 1
-    C = 1
-    E, K = log_theta.shape[0], log_theta.shape[1]
-    assert E % C == 0
-    adj_loss = torch.stack(
-        [adj_loss_func(log_theta[:, kk], self.label) for kk in range(K)], dim=1)
-
-    const = torch.zeros(num_subgraph).to(self.label.device) # S
+    num_edges = log_theta.shape[0]
+    adj_ij_loss = torch.stack([adj_loss_func(log_theta[:, 0, i], self.label_ij) 
+                            for i in range(self.cf.num_mix_component)], dim=1)
+    adj_ji_loss = torch.stack([adj_loss_func(log_theta[:, 1, i], self.label_ji) 
+                            for i in range(self.cf.num_mix_component)], dim=1)
+    adj_loss = adj_ij_loss+adj_ji_loss
+    # num of new edges for each subgraph
+    const = torch.zeros(num_subgraph).to(self.device) # S
     const = const.scatter_add(0, self.subgraph_idx,
                               torch.ones_like(self.subgraph_idx).float())
-
-    reduce_adj_loss = torch.zeros(num_subgraph, K).to(self.label.device)
+    # sum over all edges in each subgraph
+    reduce_adj_loss = torch.zeros(num_subgraph, self.cf.num_mix_component).to(self.device)
     reduce_adj_loss = reduce_adj_loss.scatter_add(
-        0, self.subgraph_idx.unsqueeze(1).expand(-1, K), adj_loss)
-
-    reduce_log_alpha = torch.zeros(num_subgraph, K).to(self.label.device)
+        0, self.subgraph_idx.unsqueeze(1).expand(-1, self.cf.num_mix_component), adj_loss)
+    # average over all edges in the same subgraph, then softmax
+    reduce_log_alpha = torch.zeros(num_subgraph, self.cf.num_mix_component).to(self.device)
     reduce_log_alpha = reduce_log_alpha.scatter_add(
-        0, self.subgraph_idx.unsqueeze(1).expand(-1, K), log_alpha)
+        0, self.subgraph_idx.unsqueeze(1).expand(-1, self.cf.num_mix_component), log_alpha)
     reduce_log_alpha = reduce_log_alpha / const.view(-1, 1)
-    reduce_log_alpha = F.log_softmax(reduce_log_alpha, -1)
-
+    reduce_log_alpha = F.log_softmax(reduce_log_alpha, -1) # log probability
     log_prob = -reduce_adj_loss + reduce_log_alpha
-    log_prob = torch.logsumexp(log_prob, dim=1) # S, K
-
-    bc_log_prob = torch.zeros([B*C]).to(self.label.device) # B*C
-    bc_idx = torch.arange(B*C).to(self.label.device) # B*C
-    bc_const = torch.zeros(B*C).to(self.label.device)
-    bc_size = (self.subgraph_idx_base[1:] - self.subgraph_idx_base[:-1]) // C # B
-    bc_size = torch.repeat_interleave(bc_size, C) # B*C
+    log_prob = torch.logsumexp(log_prob, dim=1) # num_subgraphs 
+    bc_log_prob = torch.zeros([num_graphs]).to(self.device) # num_graphs
+    bc_idx = torch.arange(num_graphs).to(self.device) # num_graphs
+    bc_const = torch.zeros(num_graphs).to(self.device)
+    bc_size = (self.subgraph_idx_base[1:] - self.subgraph_idx_base[:-1]) # num_graphs
+    bc_size = torch.repeat_interleave(bc_size, 1) # num_graphs
     bc_idx = torch.repeat_interleave(bc_idx, bc_size) # S
     bc_log_prob = bc_log_prob.scatter_add(0, bc_idx, log_prob)
     # loss must be normalized for numerical stability
     bc_const = bc_const.scatter_add(0, bc_idx, const)
     bc_loss = (bc_log_prob / bc_const)
-
-    bc_log_prob = bc_log_prob.reshape(B,C)
-    bc_loss = bc_loss.reshape(B,C)
+    bc_log_prob = bc_log_prob.reshape(num_graphs,1)
+    bc_loss = bc_loss.reshape(num_graphs,1)
     if sum_order_log_prob:
       b_log_prob = torch.sum(bc_log_prob, dim=1)
       b_loss = torch.sum(bc_loss, dim=1)
     else:
       b_log_prob = torch.logsumexp(bc_log_prob, dim=1)
       b_loss = torch.logsumexp(bc_loss, dim=1)
-
     # probability calculation was for lower-triangular edges
     # must be squared to get probability for entire graph
     b_neg_log_prob = -2*b_log_prob
     b_loss = -b_loss
-
     if reduction == "mean":
       neg_log_prob = b_neg_log_prob.mean()
       loss = b_loss.mean()
@@ -537,7 +531,6 @@ class GraphGenGnn(nn.Module):
       assert reduction == "none"
       neg_log_prob = b_neg_log_prob
       loss = b_loss
-
     if return_neg_log_prob:
       return loss, neg_log_prob
     else:
@@ -545,7 +538,6 @@ class GraphGenGnn(nn.Module):
 
  
   def _forward_sampling(self, gene_codes, graphs_size):
-    # TODO implement conditional version of this
     """
     The gradient will explode, if training with this 
     NOTE!!! if num_new_nodes >= 2, there is an overlap in updating !!! 
@@ -575,8 +567,7 @@ class GraphGenGnn(nn.Module):
         edges = torch.cat([ adj[i].to_sparse().coalesce().indices() + i * end_idx
                               for i in range(num_graphs) ], dim=1).t()
         #- create one-hot feature for all edges
-        # new_num_nodes -> num_graphs*new_num_nodes x 1
-        # dim_att_edge has to be at least the size of num_new_nodes + 1
+        # end_idx -> num_graphs*end_idx x 1, dim_att_edge has to be at least the size of num_new_nodes + 1
         # [0 1] if source node is new node 1, [0 0 1] if source node is new node 2, otherwise [1 0]
         # similar to above, but for target nodes
         att_idx = torch.cat([torch.zeros(start_idx).long(), 
@@ -594,30 +585,22 @@ class GraphGenGnn(nn.Module):
         # num_graphs x num_new_nodes x end_idx x dim_node_feature -> ... x dim_node_feature
         ## -> ... x 2*num_mixture   &&   .. x new_num_nodes*num_new_nodes x num_mixture
         diff = diff.view(-1, node_state_out.shape[2])
-        #log_theta = self.output_theta(diff).view(num_graphs, -1, self.cf.num_new_nodes, self.cf.num_mix_component).transpose(1, 2)
-        log_theta = self.output_theta(diff).view(num_graphs, self.cf.num_new_nodes, end_idx, 1, self.cf.num_mix_component)
+        log_theta = self.output_theta(diff).view(num_graphs, self.cf.num_new_nodes, end_idx, 2, self.cf.num_mix_component)
         log_alpha = self.output_alpha(diff).view(num_graphs, -1, self.cf.num_mix_component)
         prob_alpha = F.softmax(log_alpha.mean(dim=1), -1) # mixture components sum to 1
-
-        # original sampling scheme, first mixture component, then bernulli
+        #--- original sampling scheme, first mixture component, then bernulli
         alpha = torch.multinomial(prob_alpha, 1).squeeze(dim=1).long()
-        prob = []
+        prob_ij, prob_ji = [], []
         for bb in range(num_graphs):
-          prob += [torch.sigmoid(log_theta[bb, :, :, 0, alpha[bb]])]
-        prob = torch.stack(prob, dim=0)
-
-        #prob = prob_alpha.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(num_graphs,  
-        #            self.cf.num_new_nodes, end_idx, 2, self.cf.num_mix_component)*torch.sigmoid(log_theta) 
-        #prob = prob.mean(dim=-1)
-
-        prob_ij, prob_ji = prob[:,:self.cf.num_new_nodes,:], prob[:,:self.cf.num_new_nodes,:]
-        ## sampling
-        edges_ij =  torch.bernoulli(prob_ij)
-        edges_ji = edges_ij.transpose(1,2) 
-
-        # update
+          prob_ij += [torch.sigmoid(log_theta[bb, :, :, 0, alpha[bb]])]
+          prob_ji += [torch.sigmoid(log_theta[bb, :, :, 1, alpha[bb]])]
+        prob_ij, prob_ji = torch.stack(prob_ij, dim=0), torch.stack(prob_ji, dim=0)
+        prob_edges = torch.stack([prob_ij, prob_ji], dim=-1)
+        #--- sampling
+        edges_ij, edges_ji = torch.bernoulli(prob_edges[:,:,:,0]), torch.bernoulli(prob_edges[:,:,:,1])
+        #--- updating
         A[:, start_idx:end_idx, :end_idx] = edges_ij
-        A[:, :end_idx, start_idx: end_idx] = edges_ji
+        A[:, :end_idx, start_idx: end_idx] = edges_ji.transpose(1,2)
         node_vecs = torch.cat([A[:, start_idx: end_idx, :], A[:, :, start_idx: end_idx].transpose(1,2)], dim=-1)
         node_state[:, start_idx: end_idx, :] = self.adj_vecs_to_nodes_state(node_vecs)
       return A, None 

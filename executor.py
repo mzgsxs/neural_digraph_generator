@@ -166,13 +166,14 @@ class executor(object):
     model = model.to(0)
     # load model
     model_path = os.path.join(self.config.inspect.resume_dir, self.config.inspect.resume_model_file_name)
-    load_model(model,
-               model_path,
-               self.config.device)
+    load_model(model, model_path, self.config.device)
     # Sampling Loop
+    print('generating ...')
     existance_score, features = model.sample(16) # draw 16 graphs in 4 by 4
+    print('converting ...')
     graphs_hat = model.to_graph(existance_score, features)
     # convert sparse graphs to networkx format and draw the graph and save it
+    print('drawing ...')
     utils.draw_a_list_of_graphs(graphs_hat, 4, 4, os.path.join(self.config.save_dir,'generation_samples'))
     return True
 

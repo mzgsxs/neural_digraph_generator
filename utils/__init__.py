@@ -54,12 +54,27 @@ def snapshot(model, optimizer, config, step, gpus=[0], tag=None, scheduler=None)
 
 def load_model(model, file_name, device, optimizer=None, scheduler=None):
   model_snapshot = torch.load(file_name, map_location=device)  
-  model.load_state_dict(model_snapshot["model"])
-  if optimizer is not None:
-    optimizer.load_state_dict(model_snapshot["optimizer"])
+  # if we have changed the model, load part of those weights
+  try:
+    model.load_state_dict(model_snapshot["model"])
+    if optimizer is not None: optimizer.load_state_dict(model_snapshot["optimizer"])
+  except:
+    print("WARNING!!! model parameters dismatch, partial loading is performed ... ")
+    model.load_state_dict(partial_load_state_dict(model, model_snapshot["model"]))
+    if optimizer is not None: 
+      optimizer.load_state_dict(partial_load_state_dict(optimizer, model_snapshot["model"]))
 
   if scheduler is not None:
     scheduler.load_state_dict(model_snapshot["scheduler"])
+
+
+def partial_load_state_dict(new, to_load):
+    new_state = new.state_dict()
+    for name, param in to_load.items():
+        if name not in new_state: continue
+        try: new_state[name].copy_(param)
+        except: continue
+    return new_state
 
 
 def sparse_tensor_to_digraph(g):
@@ -109,14 +124,12 @@ def draw_a_list_of_graphs(G_list, row, col, fname, layout='spring'):
         plt.subplot(row,col,i+1)
         plt.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=0, hspace=0)
         plt.axis("off")
-        if layout=='spring':
-            pos = nx.spring_layout(G,iterations=100)
-        elif layout=='spectral':
-            pos = nx.spectral_layout(G)
+        if layout=='spring': pos = nx.spring_layout(G,iterations=100)
+        elif layout=='spectral': pos = nx.spectral_layout(G)
         nx.draw_networkx_nodes(G, pos, node_size=1.5, alpha=1, linewidths=0.2)
         nx.draw_networkx_edges(G, pos, alpha=0.3, width=0.2, arrowsize=1)
     plt.tight_layout()
-    plt.savefig(fname+'.png', dpi=1800)
+    plt.savefig(fname+'.png', dpi=600)
     plt.close()
 
 
