@@ -53,7 +53,7 @@ model:
   dim_gene_code: 128
   decoder:
     name: gnn
-    sample_subgraphs: 100  # only sample some of those subgraphs
+    sample_subgraphs: 90  # only sample some of those subgraphs
     stride: 1 # self.num_new_nodes-1 # 1 # sample_stride
     num_new_nodes: 1 # block_size, num of nodes to add at each iteration
     max_num_nodes: 400
