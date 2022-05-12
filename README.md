@@ -1,5 +1,5 @@
-# di-graph generator
-Generate directed graph (but possibly cyclic) by learning from data
+# Neural di-graph generator
+Generate directed graph (but possibly cyclic) by artifical neural networks 
 
 
 
