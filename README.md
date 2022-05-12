@@ -1,2 +1,5 @@
-# graph_generator
-generate directed graph
+# di-graph generator
+Generate directed graph (but possibly cyclic) by learning from data
+
+
+
